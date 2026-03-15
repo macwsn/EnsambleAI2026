@@ -1,0 +1,108 @@
+```py
+import pandas as pd
+import numpy as np
+from sklearn.pipeline import make_union
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+from lightgbm import LGBMClassifier
+
+from skfp.preprocessing import MolFromSmilesTransformer
+from skfp.fingerprints import ECFPFingerprint, MACCSFingerprint
+
+print("Wczytywanie danych...")
+train = pd.read_parquet("chebi_dataset_train.parquet")
+test = pd.read_parquet("chebi_dataset_test_empty.parquet")
+
+label_cols = [f"class_{i}" for i in range(500)]
+smiles_train = train["SMILES"].tolist()
+y_train = train[label_cols].values
+smiles_test = test["SMILES"].tolist()
+
+mol_transformer = MolFromSmilesTransformer(n_jobs=-1)
+mols_train = mol_transformer.fit_transform(smiles_train)
+mols_test = mol_transformer.transform(smiles_test)
+
+print("Ekstrakcja fingerprintów...")
+feature_union = make_union(
+    ECFPFingerprint(fp_size=2048, radius=2, n_jobs=-1),
+    MACCSFingerprint(n_jobs=-1),
+    n_jobs=1,
+)
+
+mols_tr, mols_val, y_tr, y_val = train_test_split(
+    mols_train, y_train, test_size=0.15, random_state=42
+)
+
+print("Transformacja danych treningowych...")
+X_tr = feature_union.fit_transform(mols_tr)
+X_val = feature_union.transform(mols_val)
+
+print("Trenowanie LGBMa...")
+lgbm_params = dict(
+    n_estimators=300,
+    learning_rate=0.05,
+    num_leaves=31,
+    n_jobs=1,
+    importance_type="gain",
+)
+
+model = MultiOutputClassifier(LGBMClassifier(**lgbm_params), n_jobs=-1)
+model.fit(X_tr, y_tr)
+
+
+def parse_obo(path):
+    child_to_parents = {}
+    current_id = None
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("id: "):
+                current_id = line.split("id: ")[1]
+            elif line.startswith("is_a: "):
+                parent = line.split("is_a: ")[1].split(" ! ")[0].strip()
+                child_to_parents.setdefault(current_id, []).append(parent)
+    return child_to_parents
+
+
+print("Analiza ontologii...")
+hierarchy = parse_obo("classes.obo")
+
+col_to_idx = {c: i for i, c in enumerate(label_cols)}
+
+
+def enforce_hierarchy(predictions, hierarchy, col_to_idx):
+    result = predictions.copy()
+    for _ in range(3):
+        for child, parents in hierarchy.items():
+            if child in col_to_idx:
+                ci = col_to_idx[child]
+                for parent in parents:
+                    if parent in col_to_idx:
+                        pi = col_to_idx[parent]
+                        result[:, pi] = np.maximum(result[:, pi], result[:, ci])
+    return result
+
+
+y_val_pred = model.predict(X_val)
+f1_raw = f1_score(y_val, y_val_pred, average="macro")
+y_val_c = enforce_hierarchy(y_val_pred, hierarchy, col_to_idx)
+f1_corr = f1_score(y_val, y_val_c, average="macro")
+
+print(f"Macro F1 (przed korektą): {f1_raw:.4f}")
+print(f"Macro F1 (po korekcie):   {f1_corr:.4f}")
+
+print("Retrenowanie na pełnym zbiorze treningowym...")
+X_full = feature_union.fit_transform(mols_train)
+model.fit(X_full, y_train)
+
+print("Generowanie wyników dla zbioru testowego...")
+X_test = feature_union.transform(mols_test)
+y_test_pred = model.predict(X_test)
+y_test_fin = enforce_hierarchy(y_test_pred, hierarchy, col_to_idx)
+
+submission = test[["mol_id", "SMILES"]].copy()
+submission[label_cols] = y_test_fin.astype(np.int64)
+submission.to_parquet("chebi_submission.parquet", index=False)
+print("Zapisano: chebi_submission.parquet")
+```
