@@ -1,4 +1,3 @@
-```py
 import pandas as pd
 import numpy as np
 from sklearn.pipeline import make_union
@@ -105,4 +104,3 @@ submission = test[["mol_id", "SMILES"]].copy()
 submission[label_cols] = y_test_fin.astype(np.int64)
 submission.to_parquet("chebi_submission.parquet", index=False)
 print("Zapisano: chebi_submission.parquet")
-```
